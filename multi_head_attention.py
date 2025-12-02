@@ -159,8 +159,8 @@ class MultiHeadAttention(nn.Module):
         :return: values (N, H, S or T, E/H), attention scores (N, H, S or T, S or T)
         """
         if src_padding_mask is not None:
-            N, H, S, E = q.shape
-            q.masked_fill_(~src_padding_mask.reshape(N, 1, S, 1), 0.0)
+            N, S = src_padding_mask.shape
+            k.masked_fill_(~src_padding_mask.reshape(N, 1, S, 1), 0.0)
         attention_matrix = torch.matmul(q, k.transpose(-1, -2))
         if future_mask is not None:
             attention_matrix = self.mask_logits(attention_matrix, future_mask=future_mask)

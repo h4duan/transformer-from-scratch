@@ -52,12 +52,13 @@ class TransformerEncoder(nn.Module):
         :param src_padding_mask: An attention mask to ignore pad-tokens in the source input. Shape (N, S)
         :return: The encoder's final (contextualized) token embeddings. Shape: (N, S, E)
         """
-        x = self.embed(input_ids) * math.sqrt(self.hidden_dim)  # (N, S, E)
-        x = self.positional_encoding(x)
-        x = self.dropout(x)
+        x = self.embed(input_ids)
+        x = self.dropout(self.positional_encoding(x))
         for encoder_block in self.encoder_blocks:
-            x = encoder_block.forward(x, src_padding_mask=src_padding_mask)
+            x = encoder_block(x, src_padding_mask)
         return x
+
+
 
 
 class EncoderBlock(nn.Module):
@@ -85,14 +86,11 @@ class EncoderBlock(nn.Module):
         :param src_padding_mask: An attention mask to ignore pad-tokens in the source input. Shape (N, S)
         :return: Updated intermediate encoder (contextualized) token embeddings. Shape: (N, S, E)
         """
-        output = self.dropout1(
-            self.self_mha.forward(x, src_padding_mask=src_padding_mask)
-        )
-        x = self.layer_norm1(x + output)
-
-        output = self.dropout2(self.feed_forward(x))
-        x = self.layer_norm2(x + output)
+        x = self.layer_norm1(x + self.dropout1(self.self_mha(x, src_padding_mask=src_padding_mask)))
+        x = self.layer_norm2(x + self.dropout2(self.feed_forward(x)))
         return x
+
+       
 
 
 class TestTransformerEncoder(unittest.TestCase):

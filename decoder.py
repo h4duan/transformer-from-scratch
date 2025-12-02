@@ -70,17 +70,12 @@ class TransformerDecoder(nn.Module):
         :param future_mask: An attention mask to ignore future-tokens in the target input. Shape (T, T)
         :return: Unnormalized logits over the vocabulary for every token in the batch. Shape (N, T, V)
         """
-        # (batch_size, sequence_length, hidden_dim)
-        x = self.embed(input_tokens) * math.sqrt(self.hidden_dim)
-        x = self.positional_encoding(x)
-        x = self.dropout(x)
-
+        x = self.embed(input_tokens)
+        x = self.dropout(self.positional_encoding(x))
         for decoder_block in self.decoder_blocks:
             x = decoder_block(x, encoder_hidden_states, src_padding_mask, future_mask)
-
-        # (batch_size, sequence_length, vocab_size)
-        logits = self.output_layer(x)
-        return logits
+        return self.output_layer(x)
+        
 
 
 class TransformerDecoderBlock(nn.Module):
@@ -124,25 +119,12 @@ class TransformerDecoderBlock(nn.Module):
         :param future_mask: An attention mask to ignore future-tokens in the target input. Shape (T, T)
         :return: Updated, contextualized token embeddings. Shape (N, T, E)
         """
-
-        # Self attention (with future masking during training)
-        output = self.dropout1(self.self_mha.forward(x, future_mask=future_mask))
-        x = self.layer_norm1(x + output)
-
-        # Cross or encoder-decoder attention
-        output = self.dropout2(
-            self.cross_mha.forward(
-                x,
-                encoder_hidden_states=encoder_hidden_states,
-                src_padding_mask=src_padding_mask,
-            )
-        )
-        x = self.layer_norm2(x + output)
-
-        # Feed forward layers
-        output = self.dropout3(self.feed_forward(x))
-        x = self.layer_norm3(x + output)
+        x = self.layer_norm1(x + self.dropout1(self.self_mha(x, future_mask=future_mask)))
+        x = self.layer_norm2(x + self.dropout2(self.cross_mha(x, encoder_hidden_states=encoder_hidden_states, src_padding_mask=src_padding_mask)))
+        x = self.layer_norm3(x + self.dropout3(self.feed_forward(x)))
         return x
+
+        
 
 
 class TestTransformerDecoder(unittest.TestCase):
