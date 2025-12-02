@@ -53,28 +53,19 @@ class MultiHeadAttention(nn.Module):
         :return: Contextualized token embeddings. Shape depends on attention type. (N, S, E) for encoder self-attention
         and decoder cross-attention. (N, T, E) for decoder self-attention.
         """
-
-        batch_size, sequence_length, hidden_dim = x.size()
-
         if encoder_hidden_states is None:
-            q, k, v = self._self_attention_projection(x)
+            query, key, value = self._self_attention_projection(x)
         else:
-            q, k, v = self._cross_attention_projection(encoder_hidden_states, x)
+            query, key, value = self._cross_attention_projection(encoder_hidden_states, x)
 
-        # Swap dimensions to (batch_size, n_heads, seq_len, qkv_dim). Required for the matrix multiplication below
-        q = q.permute(0, 2, 1, 3)
-        k = k.permute(0, 2, 1, 3)
-        v = v.permute(0, 2, 1, 3)
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+        embeddings, attention_score = self.scaled_dot_product(query, key, value, src_padding_mask, future_mask)
+        N, H, S, E = embeddings.shape
+        embeddings = embeddings.transpose(1, 2).reshape(N, S, H * E)
+        return self.o_proj(embeddings)
 
-        # Compute (contextualized) value vector for each "head"
-        values, attn = self.scaled_dot_product(q, k, v, src_padding_mask, future_mask)
-
-        # Concatenate contextualized value vectors from all heads
-        values = values.reshape(batch_size, sequence_length, hidden_dim)
-
-        # Linearly transform the concatenation of all heads' value vectors (8*64=512) to the original hidden dim (512)
-        output = self.o_proj(values)
-        return output
 
     def _self_attention_projection(self, x: torch.Tensor):
         """
@@ -90,11 +81,16 @@ class MultiHeadAttention(nn.Module):
         :param x: Encoder or decoder hidden states. (N, S or T, E)
         :return: query, key and value vectors. (N, S or T, H, E/H)
         """
-        batch_size, sequence_length, _ = x.shape
-        qkv = self.qkv_proj(x)
-        qkv = qkv.reshape(batch_size, sequence_length, self.num_heads, 3 * self.qkv_dim)
-        q, k, v = qkv.chunk(3, dim=-1)
-        return q, k, v
+
+        qkv_states = self.qkv_proj(x)
+        N, S, E = x.shape 
+
+        # N S 3* E
+        query, key, value = torch.chunk(qkv_states, 3, dim=-1)
+        query = query.reshape(N, S, self.num_heads, -1)
+        key = key.reshape(N, S, self.num_heads, -1)
+        value = value.reshape(N, S, self.num_heads, -1)
+        return query, key, value
 
     def _cross_attention_projection(
         self, encoder_hidden_states: torch.Tensor, decoder_hidden_states: torch.Tensor,
@@ -115,25 +111,24 @@ class MultiHeadAttention(nn.Module):
         :param decoder_hidden_states: Shape: (N, T, E)
         :return: query vector: Shape: (N, T, H, E/H) and key and value vectors both (N, S, H, E/H)
         """
-        batch_size, src_sequence_length, hidden_dim = encoder_hidden_states.shape
-        batch_size, tgt_sequence_length, hidden_dim = decoder_hidden_states.shape
+        qkv_states = self.qkv_proj(decoder_hidden_states) 
+        # N S 3* E
+        query, _, _ = torch.chunk(qkv_states, 3, dim=-1)
+        N, S, E = decoder_hidden_states.shape  
+        query = query.reshape(N, S, self.num_heads, -1)
 
-        # Split weight matrix
-        w_q, w_kv = self.qkv_proj.weight.split([hidden_dim, 2 * hidden_dim])
+        qkv_states = self.qkv_proj(encoder_hidden_states) 
+        # N S 3* E
+        N, T, E = encoder_hidden_states.shape 
+        _, key, value = torch.chunk(qkv_states, 3, dim=-1)
+        key = key.reshape(N, T, self.num_heads, -1)
+        value = value.reshape(N, T, self.num_heads, -1)
+       
+        return query, key, value
 
-        # Project encoder_hidden_states into k's, and v's
-        k, v = (
-            F.linear(input=encoder_hidden_states, weight=w_kv)
-            .reshape(batch_size, src_sequence_length, self.num_heads, 2 * self.qkv_dim)
-            .chunk(2, dim=-1)
-        )
 
-        # Project decoder hidden states into q's
-        q = F.linear(input=decoder_hidden_states, weight=w_q).reshape(
-            batch_size, tgt_sequence_length, self.num_heads, self.qkv_dim
-        )
 
-        return q, k, v
+       
 
     def scaled_dot_product(
         self,
@@ -163,26 +158,20 @@ class MultiHeadAttention(nn.Module):
         Shape: (T, T).
         :return: values (N, H, S or T, E/H), attention scores (N, H, S or T, S or T)
         """
+        if src_padding_mask is not None:
+            N, H, S, E = q.shape
+            q.masked_fill_(~src_padding_mask.reshape(N, 1, S, 1), 0.0)
+        attention_matrix = torch.matmul(q, k.transpose(-1, -2))
+        if future_mask is not None:
+            attention_matrix = self.mask_logits(attention_matrix, future_mask=future_mask)
+        if src_padding_mask is not None:
+            attention_matrix = self.mask_logits(attention_matrix, src_padding_mask=src_padding_mask)
+        E = q.size(-1)
+        attention_scores = torch.softmax(attention_matrix / math.sqrt(E), dim=-1)
+        values = torch.matmul(attention_scores, v)
+        return values, attention_scores
 
-        # Compute attention logits. Dot product between each query and key vector, through one matrix multiplication.
-        # Results in un-normalized attention scores for each position's query vector to each position's key vector
-        # Result is (batch_size, num_heads, seq_length, seq_length)
-        attn_logits = torch.matmul(q, torch.transpose(k, -2, -1),)
 
-        # Scale logits by constant to create less spiky softmax distribution
-        attn_logits = attn_logits / math.sqrt(q.size()[-1])
-
-        # Apply attention mask (for pad tokens and future-masking in cross-attention)
-        if src_padding_mask is not None or future_mask is not None:
-            attn_logits = self.mask_logits(attn_logits, src_padding_mask, future_mask)  # type: ignore
-
-        # Transform logits to attention probability distribution (one distribution per non-masked token index)
-        attention = F.softmax(attn_logits, dim=-1)
-
-        # Weighted sum of value vectors for each input token using attention scores -> new contextualized representation
-        # (batch_size, num_heads, sequence_length, qkv_dim)
-        values = torch.matmul(attention, v)
-        return values, attention
 
     @staticmethod
     def mask_logits(
@@ -207,13 +196,14 @@ class MultiHeadAttention(nn.Module):
         Shape: (T, T).
         :return: masked_logits (N, H, S or T, S or T)
         """
-        if src_padding_mask is not None:
-            masked_logits = logits.masked_fill(
-                src_padding_mask[:, None, None, :] == 0, float("-inf")
-            )
         if future_mask is not None:
-            masked_logits = logits.masked_fill(future_mask == 0, float("-inf"))
-        return masked_logits
+            logits = logits.masked_fill(~future_mask, float("-inf"))
+        if src_padding_mask is not None:
+            N, S = src_padding_mask.shape
+            logits = logits.masked_fill(~src_padding_mask.reshape(N, 1, 1, S), float("-inf"))
+        return logits 
+            
+        
 
 
 class TestMultiHeadAttention(unittest.TestCase):
@@ -245,6 +235,7 @@ class TestMultiHeadAttention(unittest.TestCase):
         )
 
         _, attention_scores = mha.scaled_dot_product(q, k, v, src_padding_mask=mask)
+
         self.assertEqual(torch.any(torch.isnan(attention_scores)), False)
 
         # For the first sequence we expect the last two (8-10) attention scores for every attention distribution
@@ -258,7 +249,7 @@ class TestMultiHeadAttention(unittest.TestCase):
 
         # For the second sequence in the batch all attention scores should be nonzero because the mask is all ones
         self.assertEqual(torch.any(attention_scores[1] == 0), False)
-
+    
     def test_mha_self_attention_forward(self):
         mha = MultiHeadAttention(512, 8)
         x = torch.randn(4, 10, 512, dtype=torch.float)
@@ -275,6 +266,7 @@ class TestMultiHeadAttention(unittest.TestCase):
         )
         self.assertEqual(output.shape, (4, 2, 512))
         self.assertEqual(torch.any(torch.isnan(output)), False)
+
 
     def test_future_masking(self):
         batch_size, n_heads, seq_len = 2, 2, 3  # TODO add 2 heads and batch_size=3
